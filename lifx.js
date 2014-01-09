@@ -10,6 +10,31 @@ var port = 56700;
 
 var debug = false;
 
+// This represents each individual bulb
+function Bulb(_lifxAddress, _name, _state) {
+	this.lifxAddress = _lifxAddress;
+	this.name        = _name;
+	this.updateState(_state);
+}
+
+Bulb.prototype.updateState = function (s) {
+	this.state			 = s;
+	delete this.state.bulbLabel;
+};
+
+// This represents the gateway, and its respective functions (eg discovery, send-to-all etc)
+function Gateway(ipAddress, port, site) {
+	// TODO: validation...
+	this.ipAddress = {ip:ipAddress, port:port};
+	this.lifxAddress = site;
+	this.tcpClient = null;
+	this.reconnect = true;
+	events.EventEmitter.call(this);
+}
+
+// Make the Gateway into an event emitter
+Gateway.prototype.__proto__ = events.EventEmitter.prototype;
+
 function init() {
 	var l = new Lifx();
 	l.startDiscovery();
@@ -19,7 +44,9 @@ function init() {
 function Lifx() {
 	events.EventEmitter.call(this);
 	this.gateways = [];
-	this.bulbs = [];
+	this.bulbs = {};  // store each bulb by name
+	this.groups = {}; // each tag contains an array of bulbs
+	this.groupLabels = {};
 	this._intervalID = null;
 }
 Lifx.prototype.__proto__ = events.EventEmitter.prototype;
@@ -71,6 +98,11 @@ Lifx.prototype.foundGateway = function(gw) {
 		gw.connect();
 		gw.on('_packet', this._getPacketHandler());
 		gw.findBulbs();
+		// tag discovery code. NOTE: not tested on multiple gateways.
+		this.on("tag", function(tag) {
+			gw.send(packet.getTagLabels({tags:tag}));		
+		});
+		
 		this.emit("gateway", gw);
 	}
 };
@@ -82,11 +114,19 @@ Lifx.prototype._getPacketHandler = function() {
 
 Lifx.prototype._gotPacket = function(data, gw) {
 	if (debug) console.log(" T- " + data.toString("hex"));
+
 	var p = packet.fromBytes(data);
+//	console.log(" T- " + p.packetTypeShortName + ": " + data.toString("utf8"));
 
 	switch (p.packetTypeShortName) {
 		case 'lightStatus':
 			this.foundBulb(p, gw);
+			break;
+		case 'tags':
+			console.log("Tags: " + p.payload.tags);
+			break;
+		case 'tagLabels':
+			this.groupLabels[p.payload.label.toString().toLowerCase()] = p.payload['tags'];
 			break;
 	}
 
@@ -95,7 +135,6 @@ Lifx.prototype._gotPacket = function(data, gw) {
 
 Lifx.prototype._gotPacket_old = function(data, gw) {
 	if (debug) console.log(" T- " + data.toString("hex"));
-
 	switch (data[32]) {
 
 		case 0x6b:
@@ -117,46 +156,37 @@ Lifx.prototype._gotPacket_old = function(data, gw) {
 
 Lifx.prototype.foundBulb = function(bulb, gw) {
 
-	var bulbName = bulb.payload.bulbLabel;
+	var bulbName = bulb.payload.bulbLabel.toLowerCase();
 	var lifxAddress = bulb.preamble.bulbAddress;
 	if (debug) console.log(" * Found a bulb: " + bulbName + " (address " + util.inspect(lifxAddress) + ")");
 
 	var foundBulb = null;
-	for (var bulbId in this.bulbs) {
-		if (this.bulbs[bulbId].lifxAddress.toString("hex") == lifxAddress.toString("hex")) {
-			foundBulb = this.bulbs[bulbId];
-		}
-	}
-
-	if (!foundBulb) {
-		var newBulb = new Bulb(lifxAddress, bulbName);
+	if (this.bulbs[bulbName] && this.bulbs[bulbName].lifxAddress.toString("hex") == lifxAddress.toString("hex")) {
+		foundBulb = this.bulbs[bulbName];
+		foundBulb.updateState(bulb.payload);
+	} else {
+		var newBulb = new Bulb(lifxAddress, bulbName, bulb.payload);
 		if (debug) console.log("*** New bulb found (" + newBulb.name + ") by gateway " + gw.ipAddress.ip + " ***");
-		this.bulbs.push(newBulb);
+		this.bulbs[bulbName] = newBulb;
+		
+		// associate bulb with group if tag is present
+		if (bulb.payload['tags']) {
+				var tag = bulb.payload['tags'];
+				if (this.groups[tag]) {
+					this.groups[tag].push(newBulb)
+				} else {
+					if (debug) console.log("*** New tag found (" + JSON.stringify(tag) + ") ***");
+					this.groups[tag] = [newBulb];
+					this.emit('tag', clone(tag));
+				}
+		}
+		
 		this.emit('bulb', clone(newBulb));
 		foundBulb = newBulb;
 	}
 
 	this.emit('bulbstate', {bulb:foundBulb, state:bulb.payload});
 };
-
-// This represents each individual bulb
-function Bulb(_lifxAddress, _name) {
-	this.lifxAddress = _lifxAddress;
-	this.name        = _name;
-}
-
-// This represents the gateway, and its respective functions (eg discovery, send-to-all etc)
-function Gateway(ipAddress, port, site) {
-	// TODO: validation...
-	this.ipAddress = {ip:ipAddress, port:port};
-	this.lifxAddress = site;
-	this.tcpClient = null;
-	this.reconnect = true;
-	events.EventEmitter.call(this);
-}
-
-// Make the Gateway into an event emitter
-Gateway.prototype.__proto__ = events.EventEmitter.prototype;
 
 Lifx.prototype.getBulbByLifxAddress = function(lifxAddress) {
 	var addrToSearch = lifxAddress;
@@ -180,15 +210,45 @@ Gateway.prototype.connect = function() {
 		self.emit('_packet', data, self);
 	});
 	this.tcpClient.on('error', function(err) {
-		console.log(err);
+		console.log("TCP client Error: " + err);
 	});
-	this.tcpClient.on('end', function() {
-		console.log('TCP client disconnected');
+	this.tcpClient.on('close', function() {
+		if (debug) console.log('TCP client disconnected');
 		self.tcpClient.destroy();
 		if (self.reconnect) {
 			self.connect();
 		}
 	});
+};
+
+Lifx.prototype.getBulbsInGroup = function(label) {
+	return this.groups[this.groupLabels[label]];
+};
+
+Lifx.prototype.listGroups = function() {
+	return Object.keys(this.groupLabels);
+};
+
+// will only return the bulbs it currently knows about.
+Lifx.prototype.listBulbs = function(label, status) {
+	if (label) {
+		var b = [];
+		this.getBulbsInGroup(label).forEach(function(n) {b.push(status ? n : n.name);})
+		return b;
+	} else {
+		return status ? this.bulbs : Object.keys(this.bulbs);
+	}
+};
+
+// will get a fresh data from the wire.
+Lifx.prototype.pollBulbs = function(label) {
+	if (label) {
+		var b = [];
+		this.getBulbsInGroup(label).forEach(function(n) {b.push(n.name);})
+		return b;
+	} else {
+		this.findBulbs();
+	}
 };
 
 Lifx.prototype.findBulbs = function() {
@@ -237,6 +297,20 @@ Lifx.prototype._sendToOneOrAll = function(command, bulb) {
 		siteAddress.copy(command, 16);
 		if (typeof bulb == 'undefined') {
 			g.send(command);
+		} else if (bulb instanceof Array) {
+			for (i in bulb) {
+				// Overwrite the bulb address here
+				var target;
+				if (Buffer.isBuffer(bulb[i])) {
+					target = bulb[i];
+				} else if (typeof bulb[i].lifxAddress != 'undefined') {
+					target = bulb[i].lifxAddress;
+				} else {
+					throw "Unknown bulb";
+				}
+				target.copy(command, 8);
+				g.send(command);
+			}
 		} else {
 			// Overwrite the bulb address here
 			var target;
@@ -253,6 +327,13 @@ Lifx.prototype._sendToOneOrAll = function(command, bulb) {
 	});
 };
 
+// Set bulbs to a particular colour
+// Pass in 16-bit numbers for each param - they will be byte shuffled as appropriate
+Lifx.prototype.setLightColour = function(bulbs, hue, sat, bright, kelvin, timing) {
+	var params = {stream:0, hue:hue, saturation:sat, brightness:bright, kelvin:kelvin, fadeTime:timing};
+	this._sendToOneOrAll(packet.setLightColour(params), bulbs);
+};
+
 /////// Fun methods ////////
 
 // Turn all lights on
@@ -263,14 +344,6 @@ Lifx.prototype.lightsOn = function(bulb) {
 // Turn all lights off
 Lifx.prototype.lightsOff = function(bulb) {
 	this._sendToOneOrAll(packet.setPowerState({onoff:0}), bulb);
-};
-
-// Set all bulbs to a particular colour
-// Pass in 16-bit numbers for each param - they will be byte shuffled as appropriate
-Lifx.prototype.lightsColour = function(hue, sat, lum, whitecol, timing, bulb) {
-	var params = {stream:0, hue:hue, saturation:sat, brightness:lum, kelvin:whitecol, fadeTime:timing};
-	var message = packet.setLightColour(params);
-	this._sendToOneOrAll(message, bulb);
 };
 
 // Request status from bulbs
