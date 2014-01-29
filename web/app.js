@@ -63,11 +63,13 @@ app.post('/bulbs/:label/color', function(req, res, next){
 	// hue 0? - 65535?
 	// kelvin 0-8000
 	// dim - TODO: add an action for dim.
+	// brightness > 50% 65535, <50% linear 65535/50
+	// saturation <=50% - 65535, 100% - 13107, 
 	var label = req.params.label.toLowerCase();
-	var bright = req.body.brightness;
+	var bright = req.body.brightness || 0;
 	var sat = req.body.saturation;
 	var hue = req.body.hue;
-	var kelvin = req.body.kelvin;
+	var kelvin = req.body.kelvin || 0;
 	
 	try {
 		if (label === "all") {
@@ -88,6 +90,8 @@ app.post('/bulbs/:label/color', function(req, res, next){
 });
 
 app.get('/bulbs', function(req, res, next) {
+	res.writeHead(200, { 'Content-Type': 'application/json' });
+	
 	if (req.param('status') != "1") {
 		res.end(JSON.stringify(lx.listBulbs(undefined, false)));
 	} else {
@@ -104,11 +108,14 @@ app.get('/bulbs', function(req, res, next) {
 });
 
 app.get('/groups', function(req, res, next){
+	res.writeHead(200, { 'Content-Type': 'application/json' });
 	res.end(JSON.stringify(lx.listGroups()));
 });
 
 app.get('/groups/:label', function(req, res, next){
 	var label = req.params.label.toLowerCase();
+	res.writeHead(200, { 'Content-Type': 'application/json' });
+	
 	if (req.param('status') != "1") {
 		res.end(JSON.stringify(lx.listBulbs(label, false)));
 	} else {

@@ -7,7 +7,7 @@ var clone = require('clone');
 var packet = require('./packet');
 
 var port = 56700;
-
+var max_connect_errors = 10;
 var debug = false;
 
 // This represents each individual bulb
@@ -28,18 +28,64 @@ function Gateway(ipAddress, port, site) {
 	this.ipAddress = {ip:ipAddress, port:port};
 	this.lifxAddress = site;
 	this.tcpClient = null;
-	this.reconnect = true;
+	this.reconnect = false;
 	events.EventEmitter.call(this);
 }
 
 // Make the Gateway into an event emitter
 Gateway.prototype.__proto__ = events.EventEmitter.prototype;
 
-function init() {
-	var l = new Lifx();
-	l.startDiscovery();
-	return l;
-}
+// This method requests that the gateway tells about all of its bulbs
+Gateway.prototype.findBulbs = function() {
+	this.send(packet.getLightState());
+};
+
+// Send a raw command
+Gateway.prototype.send = function(sendBuf) {
+	if (debug) console.log(" T+ " + sendBuf.toString("hex"));
+	var siteAddress = this.lifxAddress;
+	siteAddress.copy(sendBuf, 16);
+	console.log(this.tcpClient.isConnected);
+	if (!this.tcpClient.isConnected) {
+		this.connect();
+	}
+	this.tcpClient.write(sendBuf);
+};
+
+// Open a control connection (over TCP) to the gateway node
+Gateway.prototype.connect = function() {
+	var self = this;
+	if (true) console.log("Connecting to " + this.ipAddress.ip + ":" + this.ipAddress.port);
+	this.tcpClient = net.connect(this.ipAddress.port, this.ipAddress.ip);
+	this.tcpClient.isConnected = true;
+	this.tcpClient.on('data', function(data) {
+		self.emit('_packet', data, self);
+	});
+	this.tcpClient.on('error', function(err) {
+		console.log("TCP client Error: " + err);
+		this.isConnected = false;
+		if(err.code == 'ECONNRESET') {
+       self.tcpClient.destroy();
+	       if (self.reconnect) {
+	         self.connect();
+	       }
+	  }
+	});
+	this.tcpClient.on('close', function() {
+		if (true) console.log('TCP client disconnected');
+		this.isConnected = false;
+		self.tcpClient.destroy();
+		if (self.reconnect) {
+			self.connect();
+		}
+	});
+};
+
+// Close the connection to this gateway
+Gateway.prototype.close = function() {
+	this.reconnect = false;
+	this.tcpClient.end();
+};
 
 function Lifx() {
 	events.EventEmitter.call(this);
@@ -49,6 +95,7 @@ function Lifx() {
 	this.groupLabels = {};
 	this._intervalID = null;
 }
+
 Lifx.prototype.__proto__ = events.EventEmitter.prototype;
 
 Lifx.prototype.startDiscovery = function() {
@@ -201,26 +248,6 @@ Lifx.prototype.getBulbByLifxAddress = function(lifxAddress) {
 	return false;
 };
 
-// Open a control connection (over TCP) to the gateway node
-Gateway.prototype.connect = function() {
-	var self = this;
-	if (debug) console.log("Connecting to " + this.ipAddress.ip + ":" + this.ipAddress.port);
-	this.tcpClient = net.connect(this.ipAddress.port, this.ipAddress.ip);
-	this.tcpClient.on('data', function(data) {
-		self.emit('_packet', data, self);
-	});
-	this.tcpClient.on('error', function(err) {
-		console.log("TCP client Error: " + err);
-	});
-	this.tcpClient.on('close', function() {
-		if (debug) console.log('TCP client disconnected');
-		self.tcpClient.destroy();
-		if (self.reconnect) {
-			self.connect();
-		}
-	});
-};
-
 Lifx.prototype.getBulbsInGroup = function(label) {
 	return this.groups[this.groupLabels[label]];
 };
@@ -255,25 +282,6 @@ Lifx.prototype.findBulbs = function() {
 	this.gateways.forEach(function(g) {
 		g.findBulbs();
 	});
-};
-
-// This method requests that the gateway tells about all of its bulbs
-Gateway.prototype.findBulbs = function() {
-	this.send(packet.getLightState());
-};
-
-// Send a raw command
-Gateway.prototype.send = function(sendBuf) {
-	if (debug) console.log(" T+ " + sendBuf.toString("hex"));
-	var siteAddress = this.lifxAddress;
-	siteAddress.copy(sendBuf, 16);
-	this.tcpClient.write(sendBuf);
-};
-
-// Close the connection to this gateway
-Gateway.prototype.close = function() {
-	this.reconnect = false;
-	this.tcpClient.end();
 };
 
 Lifx.prototype.close = function() {
@@ -350,6 +358,12 @@ Lifx.prototype.lightsOff = function(bulb) {
 Lifx.prototype.requestStatus = function() {
 	this._sendToOneOrAll(packet.getLightState());
 };
+
+function init() {
+	var l = new Lifx();
+	l.startDiscovery();
+	return l;
+}
 
 module.exports = {
 	init:init,
